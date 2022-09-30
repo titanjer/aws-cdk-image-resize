@@ -8,7 +8,6 @@ import {
   PriceClass,
   SecurityPolicyProtocol,
 } from 'aws-cdk-lib/aws-cloudfront';
-import { Code, FunctionOptions, Runtime } from 'aws-cdk-lib/aws-lambda';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 
 /**
