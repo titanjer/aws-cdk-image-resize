@@ -1,12 +1,19 @@
 import * as cdk from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
-import { ImageResize } from '../src';
+import { ImageResize, ImageResizeFunction } from '../src';
 
 test('Image resize', () => {
-  const stack = new cdk.Stack();
+  const app = new cdk.App();
+  const stack = new cdk.Stack(app, 'TestStack', { env: { region: 'us-east-1' } });
 
   // WHEN
-  new ImageResize(stack, 'TestStack');
+  const func = new ImageResizeFunction(stack, 'ImageResizeFunction');
+  const props = {
+    originResponseLambdaRoleArn: func.edgeLambdaRole.roleArn,
+    originResponseLambdaVersionArn: func.imageOriginResponseLambda.currentVersion.functionArn,
+    viewerRequestLambdaVersionArn: func.imageViewerRequestLambda.currentVersion.functionArn,
+  };
+  new ImageResize(stack, 'ImageResize', props);
 
   // THEN
   const template = Template.fromStack(stack);

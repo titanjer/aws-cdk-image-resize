@@ -1,33 +1,40 @@
-import { Duration } from 'aws-cdk-lib';
+import { Duration, Stack } from 'aws-cdk-lib';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
+import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import { NodejsFunction, NodejsFunctionProps } from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Construct } from 'constructs';
-import { DistributionProps, FunctionProps } from './types';
-export * from './types';
+import { DistributionProps } from './types';
 
-export interface IImageResizeProps {
-  cloudfrontDistributionProps?: DistributionProps;
+export interface IImageResizeFunctionProps {
   originResponseLambdaProps?: NodejsFunctionProps;
-  s3BucketProps?: s3.BucketProps;
-  viewerRequestLambdaProps?: FunctionProps;
+  viewerRequestLambdaProps?: NodejsFunctionProps;
 }
 
-export class ImageResize extends Construct {
-  distribution: cloudfront.Distribution;
+export class ImageResizeFunction extends Construct {
+  edgeLambdaRole: iam.Role;
+  imageViewerRequestLambda: NodejsFunction;
   imageOriginResponseLambda: NodejsFunction;
-  imagesBucket: s3.Bucket;
-  imageViewerRequestLambda: lambda.Function;
 
-  constructor(scope: Construct, id: string, props?: IImageResizeProps) {
+  constructor(scope: Construct, id: string, props?: IImageResizeFunctionProps) {
     super(scope, id);
 
-    const { s3BucketProps, originResponseLambdaProps, viewerRequestLambdaProps, cloudfrontDistributionProps } =
-      props || {};
+    if (Stack.of(this).region !== 'us-east-1') {throw new Error('Only support in us-east-1');}
 
-    this.imagesBucket = new s3.Bucket(this, 'Bucket', s3BucketProps);
+    const { originResponseLambdaProps, viewerRequestLambdaProps } = props || {};
+
+    const managedPolicyArn = iam.ManagedPolicy.fromAwsManagedPolicyName(
+      'service-role/AWSLambdaBasicExecutionRole',
+    );
+    this.edgeLambdaRole = new iam.Role(this, 'EdgeLambdaRole', {
+      assumedBy: new iam.CompositePrincipal(
+        new iam.ServicePrincipal('lambda.amazonaws.com'),
+        new iam.ServicePrincipal('edgelambda.amazonaws.com'),
+      ),
+      managedPolicies: [managedPolicyArn],
+    });
 
     this.imageOriginResponseLambda = new NodejsFunction(this, 'OriginResponseFunction', {
       bundling: {
@@ -35,36 +42,69 @@ export class ImageResize extends Construct {
         nodeModules: ['sharp'],
       },
       entry: `${__dirname}/../lambda/image-origin-response-function/index.js`,
-      functionName: 'image-origin-response-function',
       handler: 'handler',
-      runtime: lambda.Runtime.NODEJS_12_X,
+      runtime: lambda.Runtime.NODEJS_16_X,
       timeout: Duration.seconds(15),
+      role: this.edgeLambdaRole,
+      awsSdkConnectionReuse: false,
+      memorySize: 2048,
       ...originResponseLambdaProps,
     });
 
-    this.imagesBucket.grantRead(this.imageOriginResponseLambda);
-    this.imagesBucket.grantPut(this.imageOriginResponseLambda);
-
-    this.imageViewerRequestLambda = new lambda.Function(this, 'ViewerRequestFunction', {
-      code: lambda.Code.fromAsset(`${__dirname}/../lambda/image-viewer-request-function`),
-      functionName: 'image-viewer-request-function',
-      handler: 'index.handler',
-      runtime: lambda.Runtime.NODEJS_12_X,
+    this.imageViewerRequestLambda = new NodejsFunction(this, 'ViewerRequestFunction', {
+      entry: `${__dirname}/../lambda/image-viewer-request-function/index.js`,
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_16_X,
+      role: this.edgeLambdaRole,
       ...viewerRequestLambdaProps,
     });
+  }
+}
 
-    const cachePolicy = new cloudfront.CachePolicy(this, 'CachePolicy', {
-      cachePolicyName: 'images-cache-policy',
-      defaultTtl: Duration.days(365), // 1 year
-      enableAcceptEncodingBrotli: true,
-      enableAcceptEncodingGzip: true,
-      maxTtl: Duration.days(365 * 2), // 2 years
-      minTtl: Duration.days(30 * 3), // 3 months
-      queryStringBehavior: cloudfront.CacheQueryStringBehavior.allowList('height', 'width'),
-    });
+export interface IImageResizeProps {
+  s3BucketProps?: s3.BucketProps;
+  cloudfrontDistributionProps?: DistributionProps;
+  originResponseLambdaVersionArn: string;
+  originResponseLambdaRoleArn: string;
+  viewerRequestLambdaVersionArn: string;
+}
 
+export class ImageResize extends Construct {
+  distribution: cloudfront.Distribution;
+  imagesBucket: s3.Bucket;
+
+  constructor(scope: Construct, id: string, props: IImageResizeProps) {
+    super(scope, id);
+
+    const {
+      s3BucketProps,
+      cloudfrontDistributionProps,
+      originResponseLambdaVersionArn,
+      originResponseLambdaRoleArn,
+      viewerRequestLambdaVersionArn,
+    } = props;
+
+    this.imagesBucket = new s3.Bucket(this, 'Bucket', s3BucketProps);
+    this.imagesBucket.addToResourcePolicy(
+      new iam.PolicyStatement({
+        resources: [this.imagesBucket.bucketArn, this.imagesBucket.arnForObjects('*')],
+        actions: ['s3:GetObject', 's3:PutObject', 's3:ListBucket'],
+        principals: [new iam.ArnPrincipal(originResponseLambdaRoleArn)],
+      }),
+    );
     const originAccessIdentity = new cloudfront.OriginAccessIdentity(this, 'OAI');
     this.imagesBucket.grantRead(originAccessIdentity);
+
+    const cachePolicy =
+      cloudfrontDistributionProps?.defaultBehavior?.cachePolicy ??
+      new cloudfront.CachePolicy(this, 'CachePolicy', {
+        defaultTtl: Duration.days(365), // 1 year
+        enableAcceptEncodingBrotli: true,
+        enableAcceptEncodingGzip: true,
+        maxTtl: Duration.days(365 * 2), // 2 years
+        minTtl: Duration.days(30 * 3), // 3 months
+        queryStringBehavior: cloudfront.CacheQueryStringBehavior.allowList('height', 'width'),
+      });
 
     // Cloudfront distribution for the S3 bucket.
     this.distribution = new cloudfront.Distribution(this, 'Distribution', {
@@ -75,11 +115,19 @@ export class ImageResize extends Construct {
         edgeLambdas: [
           {
             eventType: cloudfront.LambdaEdgeEventType.ORIGIN_RESPONSE,
-            functionVersion: this.imageOriginResponseLambda.currentVersion,
+            functionVersion: lambda.Version.fromVersionArn(
+              this,
+              'originResponseLambdaVersionArn',
+              originResponseLambdaVersionArn,
+            ),
           },
           {
             eventType: cloudfront.LambdaEdgeEventType.VIEWER_REQUEST,
-            functionVersion: this.imageViewerRequestLambda.currentVersion,
+            functionVersion: lambda.Version.fromVersionArn(
+              this,
+              'viewerRequestLambdaVersionArn',
+              viewerRequestLambdaVersionArn,
+            ),
           },
         ],
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
@@ -87,5 +135,7 @@ export class ImageResize extends Construct {
         ...cloudfrontDistributionProps?.defaultBehavior,
       },
     });
+
+    this.distribution.addBehavior;
   }
 }
